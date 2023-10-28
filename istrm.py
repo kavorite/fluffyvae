@@ -4,11 +4,11 @@ from stream_unzip import stream_unzip
 import polars as pl
 import fire
 import multiprocessing.pool as mpp
+import threading
 import os
 import numpy as np
 import itertools as it
 import rich.progress as rp
-from prefetch_generator import prefetch
 
 
 load_dotenv()
@@ -21,7 +21,7 @@ client = httpx.Client(
     base_url="https://huggingface.co/",
     headers={"Authorization": f"Bearer {_token}"},
     follow_redirects=True,
-    timeout=httpx.Timeout(10.0, connect=None),
+    timeout=httpx.Timeout(timeout=None),
     limits=httpx.Limits(keepalive_expiry=None),
 )
 dsslug = "planetexpress/e6"
@@ -65,10 +65,15 @@ def load_chunks(
     height=512,
     width=512,
     batch_size=32,
-    request_threads=1,
     decoder_threads=None,
+    buffer_batches=1,
 ):
+    decoder_threads = decoder_threads or min(batch_size, os.cpu_count())
+    buffer_bounds = threading.BoundedSemaphore(buffer_batches)
+
     # TODO: random crops? Res binning/resizing? (This is task parallel, so we can branch)
+    # TODO: output the applicable mask or pre-padding dims for each image (for loss)
+    # TODO: yield multiple crops per image ( ? )-- still deterministic!
     def _batched(iterable):
         iterator = iter(iterable)
         yield from iter(lambda: tuple(it.islice(iterator, batch_size)), ())
@@ -106,43 +111,36 @@ def load_chunks(
         captions = posts.select(pl.all().take(pl.col("md5").search_sorted(file_names)))
         return captions
 
+    def _content_chunks(endpoint):
+        with client.stream(
+            "GET",
+            endpoint,
+        ) as rsp:
+            yield from rsp.iter_bytes(1 << 16)
+
     def _unzip_from(endpoint):
-        while True:
-            with client.stream("GET", endpoint) as rsp:
-                istrm = rsp.iter_bytes(1 << 16)
-                triplets = (
-                    (name, size, b"".join(chunks))
-                    for name, size, chunks in stream_unzip(istrm)
-                )
-                yield from triplets
-
-    decoder_threads = decoder_threads or min(batch_size, os.cpu_count())
-    with (
-        mpp.ThreadPool(request_threads) as request_pool,
-        mpp.ThreadPool(decoder_threads) as decoder_pool,
-    ):
-
-        def _round_robin(*iterables, mapper_fn=map):
-            cursors = list(it.islice(map(iter, iterables), batch_size))
-            while True:
-                try:
-                    for i, x in enumerate(mapper_fn(next, cursors)):
-                        yield x
-                except StopIteration:
-                    cursors[i] = iter(iterables[i])
-
-        endpoints = (url for url in fetch_blob_urls() if url.endswith(".zip"))
-        unzipped = _round_robin(
-            *map(_unzip_from, endpoints),
-            mapper_fn=request_pool.imap,
+        triplets = (
+            (name, size, b"".join(chunks))
+            for name, size, chunks in stream_unzip(_content_chunks(endpoint))
         )
+        for i, triplet in zip(it.count(1), triplets):
+            if i % batch_size == 0:
+                buffer_bounds.acquire()
+            yield triplet
+
+    with mpp.ThreadPool(decoder_threads) as decoder_pool:
+        endpoints = (url for url in fetch_blob_urls() if url.endswith(".zip"))
+        unzipped = it.chain.from_iterable(map(_unzip_from, it.cycle(endpoints)))
         pairs = decoder_pool.imap(_im_decode, unzipped)
         pairs = (pair for pair in pairs if pair is not None)
 
         def _collate(pairs):
-            file_names, images = zip(*pairs)
-            images = np.stack(images)
-            return images, _metadata(file_names)
+            try:
+                file_names, images = zip(*pairs)
+                images = np.stack(images)
+                return images, _metadata(file_names)
+            finally:
+                buffer_bounds.release()
 
         yield from map(_collate, _batched(pairs))
 
@@ -150,7 +148,7 @@ def load_chunks(
 def main(posts_path="./posts.parquet"):
     posts = pl.read_parquet(posts_path)
 
-    for images, metadata in rp.track(load_chunks(posts, batch_size=32)):
+    for images, metadata in rp.track(load_chunks(posts, batch_size=1)):
         pass
 
 

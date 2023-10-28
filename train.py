@@ -1,11 +1,17 @@
-import fire
+import git
 import jax.numpy as jnp
 import jax.tree_util as jtu
 import numpy as np
+import json
 
 
 def flatten(params):
-    return jnp.concatenate([param.reshape(-1) for param in jtu.tree_leaves(params)])
+    arrays = jtu.tree_leaves(params)
+    assert all(a.dtype == arrays[0].dtype for a in arrays[1:])
+    return jnp.concatenate(
+        [param.reshape(-1) for param in jtu.tree_leaves(params)],
+        dtype=arrays[0].dtype,
+    )
 
 
 def unflatten(flat, updates):
@@ -29,26 +35,26 @@ def main(
     model_slug="stabilityai/stable-diffusion-xl-base-1.0",
     # cache_path="./base-vae",
     posts_path="./posts.parquet",
-    learning_rate=2e-6,
-    batch_size=8,
+    learning_rate=0.01,
+    batch_size=56,
     b1_min=0.85,
     b1_max=0.95,
     b2=0.99,
     epsilon=1e-5,
-    sam_stride=0.05,
+    sam_stride=0.01,
     image_size=512,
     train_steps=1024,
     warmup_steps=128,
-    weight_decay=1e-2,
+    weight_decay=0.00,
     save_every=1024,
 ):
+    import time
     import itertools as it
     import rich.progress as rp
-    import orbax.checkpoint
     from istrm import load_chunks, fetch_posts_meta
     from functools import partial
     from diffusers import FlaxAutoencoderKL
-    from flax.training import train_state, orbax_utils
+    from flax.training import train_state
     from dataclasses import replace
     import jax
     from einops import rearrange
@@ -63,16 +69,33 @@ def main(
     else:
         posts = pl.read_parquet(posts_path)
 
+    class TrainState(train_state.TrainState):
+        moment: jax.Array
+        scales: jax.Array
+        err_st: optax.EmaState
+        losses: optax.Params
+        rng: jax.random.PRNGKey
+
     with jax.default_device(jax.devices("cpu")[0]):
         vae, params = FlaxAutoencoderKL.from_pretrained(
             model_slug, dtype=jnp.bfloat16, subfolder="vae"
         )
-        params = {"params": params, "alpha": jnp.zeros([])}
+        params = jtu.tree_map(lambda a: a.astype(jnp.bfloat16), params)
+        params = {"params": params, "alpha": jnp.zeros([], dtype=jnp.bfloat16)}
+        errors = ("loss", "reconstruction_err", "blurriness_err")
+        losses = dict(zip(errors, jnp.zeros([len(errors)])))
+        tstate = TrainState.create(
+            apply_fn=vae.__call__,
+            params=params,
+            tx=optax.scale(1.0),  # no-op
+            moment=jnp.zeros_like(flatten(params), dtype=jnp.bfloat16),
+            scales=jnp.ones_like(flatten(params), dtype=jnp.bfloat16),
+            err_st=optax.ema(0.9).init(losses),
+            losses=losses,
+            rng=jax.random.PRNGKey(42),
+        )
 
-    ckpointer = orbax.checkpoint.PyTreeCheckpointer()
     shards = jsh.PositionalSharding(jax.devices())
-    params = jax.device_put(params, shards.replicate())
-
     lsched = optax.warmup_cosine_decay_schedule(
         1e-8,
         learning_rate,
@@ -83,6 +106,11 @@ def main(
     def msched(step):
         return b1_min + (b1_max - b1_min) * (lsched(step) / learning_rate)
 
+    def laplacian(gamma):
+        signal = jnp.pad(gamma, ((1, 1), (1, 1)), mode="reflect")
+        kernel = jnp.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]])
+        return jax.scipy.signal.convolve2d(signal, kernel, mode="valid")
+
     @jax.checkpoint
     def objective(params, rng, images):
         alpha = params.pop("alpha")
@@ -91,44 +119,22 @@ def main(
             {"params": params["params"]},
             images,
             rngs=rngs,
-            deterministic=False,
+            deterministic=True,
         ).sample
-        reproduction_err = optax.l2_loss(images, output)
-        spectral_maps = map(
-            lambda images: jax.vmap(jnp.fft.rfft2)(
-                rearrange(images.astype(jnp.float32), "... d h w -> (... d) h w")
-            ).real.astype(jnp.bfloat16),
+        reconstruction_err = optax.l2_loss(images, output).mean()
+        edge_maps = map(
+            lambda images: jax.vmap(laplacian)(
+                rearrange(images, "... d h w -> (... d) h w")
+            ),
             (images, output),
         )
-        spectral_maps = jnp.stack(list(spectral_maps), axis=0)
-        spectral_maps = spectral_maps[
-            ..., : spectral_maps.shape[-2] // 2, : spectral_maps.shape[-1] // 2
-        ]
-        spectral_maps = jnp.log(jnp.abs(spectral_maps))
-        blurriness_err = optax.l2_loss(*spectral_maps)
+        blurriness_err = optax.l2_loss(*edge_maps).mean()
         total_err = (
-            jax.nn.sigmoid(alpha) * reproduction_err.mean()
-            + (1 - jax.nn.sigmoid(alpha)) * blurriness_err.mean()
+            jax.nn.sigmoid(alpha) * reconstruction_err
+            + (1 - jax.nn.sigmoid(alpha)) * blurriness_err
         )
         params["alpha"] = alpha
-        return total_err
-
-    class TrainState(train_state.TrainState):
-        moment: jax.Array
-        scales: jax.Array
-        loss: jax.Array
-        rng: jax.random.PRNGKey
-
-    # Initialize our training
-    tstate = TrainState.create(
-        apply_fn=vae.__call__,
-        params=params,
-        tx=optax.scale(1.0),  # no-op
-        moment=jnp.zeros_like(flatten(params), dtype=jnp.bfloat16),
-        scales=jnp.ones_like(flatten(params), dtype=jnp.bfloat16),
-        loss=0.0,
-        rng=jax.random.PRNGKey(42),
-    )
+        return total_err, (reconstruction_err, blurriness_err)
 
     @partial(jax.jit, donate_argnums=0, out_shardings=shards.replicate())
     def train_step(tstate, images):
@@ -139,44 +145,50 @@ def main(
         params = flatten(tstate.params)
         scales = tstate.scales
         ascent = jax.random.normal(noising_key, params.shape, dtype=params.dtype)
-        ascent /= scales * np.prod(images.shape[:-3]) + epsilon
-        loss, grad = jax.value_and_grad(objective)(
-            unflatten(params + ascent, tstate.params), dropout_key, images
-        )
+        ascent /= jnp.sqrt(scales * np.prod(images.shape[:-3])) + epsilon
+        ascent = jnp.zeros_like(params)
+        (loss, (reconstruction_err, blurriness_err)), grad = jax.value_and_grad(
+            objective, has_aux=True
+        )(unflatten(params + ascent, tstate.params), dropout_key, images)
         alpha = (
             tstate.params["alpha"]
             + 0.01 * grad["alpha"]
-            - 0.01 * tstate.params["alpha"]
+            - 1e-3 * tstate.params["alpha"]
         )
+        alpha = 0.9 * tstate.params["alpha"] + 0.1 * alpha
         grad = flatten(grad)
         grad /= optax.safe_norm(grad, epsilon) * 1.0
         grad += weight_decay * params
         ascent = sam_stride * grad / scales
-        scales = b2 * scales + (1 - b2) * jnp.sqrt(scales) * jnp.abs(grad)
-        grad = jax.grad(objective)(
+        scales = b2 * scales + (1 - b2) * (jnp.sqrt(scales) * jnp.abs(grad) + 0.1)
+        grad, _ = jax.grad(objective, has_aux=True)(
             unflatten(params + ascent, tstate.params), dropout_key, images
         )
         grad = flatten(grad)
         moment = msched(tstate.step) * tstate.moment + (1 - msched(tstate.step)) * grad
         # TODO: figure out a way to perform aesthetic conditioning. GroupNorm FiLM?
         # bSAM: algorithm 1
+        step_inc = optax.safe_int32_increment(tstate.step)
+        losses = {
+            "loss": loss,
+            "reconstruction_err": reconstruction_err,
+            "blurriness_err": blurriness_err,
+        }
+        losses, err_st = optax.ema(0.9).update(losses, tstate.err_st)
         params = flatten(tstate.params) - (
             lsched(tstate.step)
-            * moment
-            / (scales + epsilon)
-            # * optax.bias_correction(moment, msched(tstate.step), tstate.step)
-            # / (optax.bias_correction(scales, b2, tstate.step) + epsilon)
+            * optax.bias_correction(moment, msched(tstate.step), step_inc)
+            / (optax.bias_correction(scales, b2, step_inc) + epsilon)
         )
         params = unflatten(params, tstate.params)
         params["alpha"] = alpha
-        avg_step = jnp.minimum(tstate.step, save_every)
-        loss_avg = (tstate.loss * avg_step + loss) / (avg_step + 1)
         tstate = replace(
             tstate,
             params=params,
             moment=moment,
             scales=scales,
-            loss=loss_avg,
+            err_st=err_st,
+            losses=losses,
             rng=rng,
             step=tstate.step + 1,
         )
@@ -189,20 +201,18 @@ def main(
         height=image_size,
         width=image_size,
     )
+    loader = iter(loader)
     loader = it.islice(loader, train_steps)
-    loader = it.starmap(
-        lambda images, meta: (
-            jax.device_put(images, shards.reshape(-1, 1, 1, 1)),
-            meta,
-        ),
-        loader,
-    )
+    tstate = jax.device_put(tstate, shards.replicate())
+
+    repo = git.Repo(".")
+    head = repo.git.rev_parse(repo.head.commit.hexsha, short=8)
     with rp.Progress(
         "loss: {task.fields[loss]:.3g}",
         *rp.Progress.get_default_columns()[:-2],
         rp.MofNCompleteColumn(),
         rp.TimeElapsedColumn(),
-    ) as progress:
+    ) as progress, open("fluffyvae.jsonl", "a+", encoding="utf8") as log:
         task = progress.add_task(
             "training...",
             start=False,
@@ -210,18 +220,26 @@ def main(
             loss=float("nan"),
         )
         for images, meta in loader:
+            images = jax.device_put(images, shards.reshape(-1, 1, 1, 1))
             tstate = train_step(tstate, images)
-            loss = jax.device_get(tstate.loss).astype(float)
-            progress.start_task(task)
-            progress.update(task, advance=1, loss=loss)
+            losses = {k: float(v) for k, v in jax.device_get(tstate.losses).items()}
             step = jax.device_get(tstate.step).astype(int)
             if step == train_steps or step % save_every == 0:
-                ckpt_target = tstate.params
-                ckpt_config = orbax_utils.save_args_from_target(ckpt_target)
-                ckpointer.save(
-                    "params.ckpt", ckpt_target, save_args=ckpt_config, force=True
+                vae.save_pretrained(
+                    "fluffyvae.ckpt",
+                    params=jax.device_get(tstate.params["params"]),
                 )
-                del ckpt_target
+            progress.start_task(task)
+            progress.update(task, advance=1, loss=losses["loss"])
+            record = {
+                "head": head,
+                "step": int(step),
+                "time": time.time(),
+                **losses,
+            }
+            record = json.dumps(record)
+            log.write(f"{record}\n")
+            log.flush()
 
 
 if __name__ == "__main__":
