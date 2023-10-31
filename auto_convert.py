@@ -1,4 +1,4 @@
-import flax.traverse_util as ftu
+# https://github.com/huggingface/diffusers/blob/main/scripts/convert_diffusers_to_original_stable_diffusion.py
 from diffusers import AutoencoderKL
 from safetensors.torch import save_file
 
