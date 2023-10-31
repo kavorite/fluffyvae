@@ -48,6 +48,7 @@ def main(
     weight_decay=0.00,
     save_every=1024,
 ):
+    config = locals().copy()
     import time
     import itertools as it
     import rich.progress as rp
@@ -83,7 +84,7 @@ def main(
         params = jtu.tree_map(lambda a: a.astype(jnp.bfloat16), params)
         params = {"params": params, "alpha": jnp.zeros([], dtype=jnp.bfloat16)}
         errors = ("loss", "reconstruction_err", "blurriness_err")
-        losses = dict(zip(errors, jnp.zeros([len(errors)])))
+        losses = dict(zip(errors, jnp.zeros([len(errors)], dtype=jnp.bfloat16)))
         tstate = TrainState.create(
             apply_fn=vae.__call__,
             params=params,
@@ -96,8 +97,9 @@ def main(
         )
 
     shards = jsh.PositionalSharding(jax.devices())
+    # lsched = optax.linear_onecycle_schedule(train_steps, learning_rate)
     lsched = optax.warmup_cosine_decay_schedule(
-        1e-8,
+        1e-5,
         learning_rate,
         warmup_steps=warmup_steps,
         decay_steps=train_steps - warmup_steps,
@@ -106,13 +108,13 @@ def main(
     def msched(step):
         return b1_min + (b1_max - b1_min) * (lsched(step) / learning_rate)
 
-    def laplacian(gamma):
-        signal = jnp.pad(gamma, ((1, 1), (1, 1)), mode="reflect")
-        kernel = jnp.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]])
-        return jax.scipy.signal.convolve2d(signal, kernel, mode="valid")
-
     @jax.checkpoint
     def objective(params, rng, images):
+        def laplacian(gamma):
+            signal = jnp.pad(gamma, ((1, 1), (1, 1)), mode="reflect")
+            kernel = jnp.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=gamma.dtype)
+            return jax.scipy.signal.convolve2d(signal, kernel, mode="valid")
+
         alpha = params.pop("alpha")
         rngs = dict(zip(["params", "dropout", "gaussian"], jax.random.split(rng, 3)))
         output = vae.apply(
@@ -124,7 +126,7 @@ def main(
         reconstruction_err = optax.l2_loss(images, output).mean()
         edge_maps = map(
             lambda images: jax.vmap(laplacian)(
-                rearrange(images, "... d h w -> (... d) h w")
+                rearrange(images.astype(jnp.bfloat16), "... d h w -> (... d) h w")
             ),
             (images, output),
         )
@@ -146,38 +148,40 @@ def main(
         scales = tstate.scales
         ascent = jax.random.normal(noising_key, params.shape, dtype=params.dtype)
         ascent /= jnp.sqrt(scales * np.prod(images.shape[:-3])) + epsilon
-        ascent = jnp.zeros_like(params)
-        (loss, (reconstruction_err, blurriness_err)), grad = jax.value_and_grad(
-            objective, has_aux=True
-        )(unflatten(params + ascent, tstate.params), dropout_key, images)
+        grad, _ = jax.grad(objective, has_aux=True)(
+            unflatten(params + ascent, tstate.params), dropout_key, images
+        )
         alpha = (
             tstate.params["alpha"]
             + 0.01 * grad["alpha"]
-            - 1e-3 * tstate.params["alpha"]
+            - 0.01 * tstate.params["alpha"]
         )
-        alpha = 0.9 * tstate.params["alpha"] + 0.1 * alpha
         grad = flatten(grad)
         grad /= optax.safe_norm(grad, epsilon) * 1.0
         grad += weight_decay * params
         ascent = sam_stride * grad / scales
-        scales = b2 * scales + (1 - b2) * (jnp.sqrt(scales) * jnp.abs(grad) + 0.1)
-        grad, _ = jax.grad(objective, has_aux=True)(
-            unflatten(params + ascent, tstate.params), dropout_key, images
+        scales = b2 * scales + (1 - b2) * (
+            jnp.sqrt(scales) * jnp.abs(grad) + 0.1 + weight_decay
         )
+        (loss, (reconstruction_err, blurriness_err)), grad = jax.value_and_grad(
+            objective, has_aux=True
+        )(unflatten(params + ascent, tstate.params), dropout_key, images)
         grad = flatten(grad)
-        moment = msched(tstate.step) * tstate.moment + (1 - msched(tstate.step)) * grad
+        step_inc = optax.safe_int32_increment(tstate.step)
+        b1 = msched(step_inc).astype(params.dtype)
+        moment = optax.update_moment(grad, tstate.moment, decay=b1, order=1)
         # TODO: figure out a way to perform aesthetic conditioning. GroupNorm FiLM?
         # bSAM: algorithm 1
-        step_inc = optax.safe_int32_increment(tstate.step)
         losses = {
             "loss": loss,
             "reconstruction_err": reconstruction_err,
             "blurriness_err": blurriness_err,
         }
         losses, err_st = optax.ema(0.9).update(losses, tstate.err_st)
-        params = flatten(tstate.params) - (
-            lsched(tstate.step)
-            * optax.bias_correction(moment, msched(tstate.step), step_inc)
+        params = flatten(tstate.params)
+        params -= (
+            lsched(step_inc).astype(params.dtype)
+            * optax.bias_correction(moment, b1, step_inc)
             / (optax.bias_correction(scales, b2, step_inc) + epsilon)
         )
         params = unflatten(params, tstate.params)
@@ -195,12 +199,7 @@ def main(
         return tstate
 
     posts = pl.read_parquet(posts_path)
-    loader = load_chunks(
-        posts,
-        batch_size=batch_size,
-        height=image_size,
-        width=image_size,
-    )
+    loader = load_chunks(posts, batch_size=batch_size)
     loader = iter(loader)
     loader = it.islice(loader, train_steps)
     tstate = jax.device_put(tstate, shards.replicate())
@@ -228,6 +227,8 @@ def main(
                 vae.save_pretrained(
                     "fluffyvae.ckpt",
                     params=jax.device_get(tstate.params["params"]),
+                    to_pytorch=True,
+                    safe_serialization=True,
                 )
             progress.start_task(task)
             progress.update(task, advance=1, loss=losses["loss"])
@@ -243,5 +244,26 @@ def main(
 
 
 if __name__ == "__main__":
+    import polars as pl
+
+    def plot_latest_run():
+        import seaborn as sns
+
+        data = (
+            pl.scan_ndjson("fluffyvae.jsonl")
+            .with_columns(
+                (pl.col("step").diff().fill_null(1) != 1).cumsum().alias("run")
+            )
+            .filter(pl.col("run") == pl.col("run").max())
+            .melt(
+                id_vars=["step"],
+                value_vars=["loss", "reconstruction_err", "blurriness_err"],
+            )
+            .collect()
+        )
+        plot = sns.lineplot(data=data.to_pandas(), x="step", y="value", hue="variable")
+        return plot
+
+    plot = plot_latest_run()
     main()
     # fire.Fire(main)
