@@ -1,3 +1,4 @@
+from functools import partial
 import httpx
 from dotenv import dotenv_values, load_dotenv
 from stream_unzip import stream_unzip
@@ -9,7 +10,8 @@ import os
 import numpy as np
 import itertools as it
 import rich.progress as rp
-
+import albumentations as iaa
+from typing import Callable, Iterator
 
 load_dotenv()
 import cv2
@@ -60,48 +62,83 @@ def fetch_posts_meta():
         return posts
 
 
+class FivePointCrop:
+    def __init__(self, dimens=[512, 512]):
+        tgt_h, tgt_w = dimens
+        dimens = np.array(dimens)
+        self.dimens = dimens
+
+        def _length_slicer(offset, target_length):
+            def _slice(length):
+                i = length + offset if offset < 0 else offset
+                j = i + target_length
+                return slice(i, j)
+
+            return _slice
+
+        _left = _length_slicer(0, tgt_w)
+        _right = _length_slicer(-tgt_w, tgt_w)
+        _top = _length_slicer(0, tgt_h)
+        _bottom = _length_slicer(-tgt_h, tgt_h)
+
+        def _corner_crop(vertical_slicer, horizontal_slicer):
+            def _crop(image):
+                img_h, img_w = image.shape[-3:-1]
+                return image[vertical_slicer(img_h), horizontal_slicer(img_w), :]
+
+            return _crop
+
+        def _central(image):
+            i, j = np.maximum(np.array(image.shape[-3:-1]) // 2 - dimens // 2, 0)
+            cropped = image[i : i + tgt_w, j : j + tgt_w, :]
+            return cropped
+
+        self.crops = [_central] + [
+            _corner_crop(*slicers)
+            for slicers in it.product((_top, _bottom), (_left, _right))
+        ]
+
+    def _pad(self, image):
+        dimens = self.dimens
+        imdims = np.array(image.shape[-3:-1])
+        deltas = np.maximum(0, dimens - imdims)
+        bottom, left = deltas // 2
+        top, right = deltas - deltas // 2
+        padding = [(top, bottom), (left, right), (0, 0)]
+        padded = np.pad(image, padding)
+        return padded
+
+    def __call__(self, image):
+        pad = self._pad
+        yield from (pad(crop(image)) for crop in self.crops)
+
+
 def load_chunks(
     posts: pl.DataFrame,
-    height=512,
-    width=512,
+    views: Callable[[np.ndarray], Iterator[np.ndarray]] = FivePointCrop([512, 512]),
     batch_size=32,
     decoder_threads=None,
-    buffer_batches=1,
+    prefetch_images=None,
 ):
     decoder_threads = decoder_threads or min(batch_size, os.cpu_count())
-    buffer_bounds = threading.BoundedSemaphore(buffer_batches)
+    prefetch_images = prefetch_images or decoder_threads * 2
+    buffer_bounds = threading.BoundedSemaphore(prefetch_images)
 
-    # TODO: random crops? Res binning/resizing? (This is task parallel, so we can branch)
     # TODO: output the applicable mask or pre-padding dims for each image (for loss)
-    # TODO: yield multiple crops per image ( ? )-- still deterministic!
+
     def _batched(iterable):
         iterator = iter(iterable)
         yield from iter(lambda: tuple(it.islice(iterator, batch_size)), ())
 
     posts = posts.sort("md5")
-    imdim = np.array([height, width])
 
     def _im_decode(triplet):
         file_name, file_size, buffer = triplet
         buffer = np.frombuffer(buffer, dtype=np.uint8)
-        image = cv2.imdecode(buffer, cv2.IMREAD_COLOR)[..., ::-1]
+        image = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
         if image is None:
             return
         else:
-            shape = np.array(image.shape[-3:-1])
-            y_center, x_center = shape // 2
-            image = image[
-                max(0, y_center - height // 2) : y_center - (height // -2),
-                max(0, x_center - width // 2) : x_center - (width // -2),
-            ]
-            if np.any(shape < np.array([height, width])):
-                width_diff, height_diff = map(int, np.maximum(imdim - shape, 0))
-                padding = [
-                    (width_diff // 2, -(width_diff // -2)),
-                    (height_diff // 2, -(height_diff // -2)),
-                    (0, 0),
-                ]
-                image = np.pad(image, padding)
             return file_name, image
 
     def _metadata(file_names):
@@ -123,32 +160,40 @@ def load_chunks(
             (name, size, b"".join(chunks))
             for name, size, chunks in stream_unzip(_content_chunks(endpoint))
         )
-        for i, triplet in zip(it.count(1), triplets):
-            if i % batch_size == 0:
-                buffer_bounds.acquire()
+        for triplet in triplets:
+            buffer_bounds.acquire()
             yield triplet
 
     with mpp.ThreadPool(decoder_threads) as decoder_pool:
         endpoints = (url for url in fetch_blob_urls() if url.endswith(".zip"))
         unzipped = it.chain.from_iterable(map(_unzip_from, it.cycle(endpoints)))
-        pairs = decoder_pool.imap(_im_decode, unzipped)
-        pairs = (pair for pair in pairs if pair is not None)
+
+        def _pairs():
+            for pair in decoder_pool.imap(_im_decode, unzipped):
+                try:
+                    if pair is None:
+                        continue
+                    else:
+                        file_name, image = pair
+                        for view in views(image):
+                            if view.shape != (512, 512, 3):
+                                pass
+                            yield (file_name, view)
+                finally:
+                    buffer_bounds.release()
 
         def _collate(pairs):
-            try:
-                file_names, images = zip(*pairs)
-                images = np.stack(images)
-                return images, _metadata(file_names)
-            finally:
-                buffer_bounds.release()
+            file_names, images = zip(*pairs)
+            images = np.stack(images)
+            return images, _metadata(file_names)
 
-        yield from map(_collate, _batched(pairs))
+        yield from map(_collate, _batched(_pairs()))
 
 
 def main(posts_path="./posts.parquet"):
     posts = pl.read_parquet(posts_path)
 
-    for images, metadata in rp.track(load_chunks(posts, batch_size=1)):
+    for images, metadata in rp.track(load_chunks(posts)):
         pass
 
 
