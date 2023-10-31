@@ -176,8 +176,6 @@ def load_chunks(
                     else:
                         file_name, image = pair
                         for view in views(image):
-                            if view.shape != (512, 512, 3):
-                                pass
                             yield (file_name, view)
                 finally:
                     buffer_bounds.release()
